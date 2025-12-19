@@ -45,30 +45,56 @@ def calculate_indicators(df):
     data = df.copy()
     
     # 1. VWAP
-    data.ta.vwap(append=True)
-    # Rename VWAP column to generic 'VWAP' for easier access if name varies
-    vwap_col = [c for c in data.columns if 'VWAP' in c][0]
-    data['VWAP'] = data[vwap_col]
+    # ใช้ try-except หรือตรวจสอบว่ามี column สร้างขึ้นหรือไม่ เพื่อความชัวร์
+    try:
+        data.ta.vwap(append=True)
+        # หา column ที่ชื่อมีคำว่า VWAP (เพราะชื่ออาจเปลี่ยนไปตาม library version)
+        vwap_col = [c for c in data.columns if 'VWAP' in c]
+        if vwap_col:
+            data['VWAP'] = data[vwap_col[0]]
+        else:
+            # Fallback ถ้าคำนวณไม่ได้ ให้ใช้ Typical Price แทนชั่วคราว
+            data['VWAP'] = (data['High'] + data['Low'] + data['Close']) / 3
+    except:
+         data['VWAP'] = (data['High'] + data['Low'] + data['Close']) / 3
     
     # 2. RSI
     data.ta.rsi(length=14, append=True)
     
-    # 3. Bollinger Bands (Width as Volatility Proxy)
-    data.ta.bbands(length=20, std=2, append=True)
-    data['BB_Width'] = (data['BBU_20_2.0'] - data['BBL_20_2.0']) / data['BBM_20_2.0']
+    # 3. Bollinger Bands (แก้ไขจุดที่ Error) -----------------------------
+    # รับค่าใส่ตัวแปร bb_df ก่อน เพื่อดูชื่อ column ที่แท้จริง
+    bb_df = data.ta.bbands(length=20, std=2)
+    
+    # รวม column เข้าไปใน data หลัก
+    data = pd.concat([data, bb_df], axis=1)
+    
+    # pandas_ta จะคำนวณ Bandwidth มาให้แล้ว มักจะขึ้นต้นด้วย 'BBB'
+    # เราจะหา column นั้นมาใช้เลย โดยไม่ต้องระบุชื่อตายตัวแบบ 'BBU_20_2.0'
+    width_col = [c for c in bb_df.columns if c.startswith('BBB')]
+    
+    if width_col:
+        data['BB_Width'] = data[width_col[0]]
+    else:
+        # กรณีหาไม่เจอจริงๆ ค่อยคำนวณมือจาก column แรก (Lower) และ column ที่ 3 (Upper)
+        # bb_df columns: [Lower, Mid, Upper, Bandwidth, Percent]
+        upper = bb_df.iloc[:, 2]
+        lower = bb_df.iloc[:, 0]
+        mid = bb_df.iloc[:, 1]
+        data['BB_Width'] = (upper - lower) / mid
+    # -------------------------------------------------------------------
     
     # 4. Stochastic
     data.ta.stoch(append=True)
     
-    # 5. Volume Profile Logic (Simplified as Relative Volume)
-    # Note: Full Volume Profile is static, for time-series HMM we need dynamic volume flow
+    # 5. Volume Logic
     data['Rel_Vol'] = data['Volume'] / data['Volume'].rolling(20).mean()
     
     # 6. Price Action (Log Returns)
     data['Log_Ret'] = np.log(data['Close'] / data['Close'].shift(1))
     
-    # Drop NaN
+    # Drop NaN (บรรทัดแรกๆ ที่อินดิเคเตอร์ยังคำนวณไม่ได้)
     data.dropna(inplace=True)
+    
     return data
 
 def train_hmm(data, n_states):
@@ -177,4 +203,5 @@ if df is not None:
     else:
         st.warning("Not enough data to train HMM. Please extend the date range.")
 else:
+
     st.info("Please verify the ticker symbol.")
