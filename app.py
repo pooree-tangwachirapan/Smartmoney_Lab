@@ -40,7 +40,7 @@ class SmartMoneyAnalyzer:
         self.data = None
         self.model = None
 
-    def fetch_data(self):
+   def fetch_data(self):
         try:
             ticker = yf.Ticker(self.symbol)
             df = ticker.history(period=self.period, interval=self.interval)
@@ -51,6 +51,7 @@ class SmartMoneyAnalyzer:
             df.columns = ['open', 'high', 'low', 'close', 'volume']
             
             # --- 1. Basic Indicators ---
+            # ใช้ np.log1p แทน log ปกติ หรือจัดการ 0 ก่อน เพื่อป้องกัน Infinity
             df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
             
             # RSI
@@ -60,63 +61,88 @@ class SmartMoneyAnalyzer:
             rs = gain / loss
             df['rsi'] = 100 - (100 / (1 + rs))
 
-            # --- 2. NEW: Trend & Location Features (GPS) ---
-            # Distance from EMA 200 (บอกความถูกแพง)
+            # --- 2. Trend & Location Features ---
+            # EMA 200
             df['ema200'] = df['close'].rolling(window=200).mean()
             df['dist_ema200'] = (df['close'] - df['ema200']) / df['ema200']
 
-            # Position in 52-week Range (บอกตำแหน่ง สูง/ต่ำ ในรอบปี)
+            # 52-week Range (252 days)
             df['min_52'] = df['close'].rolling(window=252).min()
             df['max_52'] = df['close'].rolling(window=252).max()
-            df['price_pos'] = (df['close'] - df['min_52']) / (df['max_52'] - df['min_52'])
+            
+            # ป้องกันการหารด้วย 0 กรณี High = Low
+            denom = df['max_52'] - df['min_52']
+            df['price_pos'] = np.where(denom == 0, 0, (df['close'] - df['min_52']) / denom)
 
-            # --- 3. NEW: Volatility (Squeeze) ---
-            # ATR Normalized (บอกความนิ่ง)
+            # --- 3. Volatility ---
             df['tr'] = np.maximum(df['high'] - df['low'], 
                                   np.maximum(abs(df['high'] - df['close'].shift(1)), 
                                              abs(df['low'] - df['close'].shift(1))))
             df['atr'] = df['tr'].rolling(window=14).mean()
             df['atr_pct'] = df['atr'] / df['close']
 
-            # --- 4. NEW: Volume Quality ---
-            # Relative Volume
+            # --- 4. Volume ---
             df['vol_ma'] = df['volume'].rolling(window=20).mean()
-            df['rel_vol'] = df['volume'] / df['vol_ma']
+            # ป้องกันหารด้วย 0
+            df['rel_vol'] = np.where(df['vol_ma'] == 0, 0, df['volume'] / df['vol_ma'])
 
-            # VWAP Calculation (สำหรับแสดงผล)
+            # VWAP
             df['tp'] = (df['high'] + df['low'] + df['close']) / 3
             df['cum_vol_price'] = (df['tp'] * df['volume']).cumsum()
             df['cum_vol'] = df['volume'].cumsum()
-            df['vwap'] = df['cum_vol_price'] / df['cum_vol']
+            # ป้องกันหารด้วย 0
+            df['vwap'] = np.where(df['cum_vol'] == 0, df['tp'], df['cum_vol_price'] / df['cum_vol'])
 
-            # Drop NaN (ระวัง: EMA200 ทำให้ข้อมูลหายไป 200 วันแรก)
+            # === CLEANING DATA STEP (สำคัญมาก) ===
+            # 1. แทนค่า Infinity ด้วย NaN
+            df.replace([np.inf, -np.inf], np.nan, inplace=True)
+            
+            # 2. ลบแถวที่มี NaN (ข้อมูลช่วงต้นจะหายไป 200-252 วัน เพราะเราใช้ EMA200/MinMax252)
             df.dropna(inplace=True)
+
+            # 3. เช็คว่าเหลือข้อมูลพอไหมหลังจากลบ
+            if len(df) < 50:
+                st.error(f"ข้อมูลไม่เพียงพอสำหรับการวิเคราะห์ (เหลือ {len(df)} วัน) กรุณาเพิ่ม Period เป็น '2y' หรือ '5y' เพราะต้องใช้ข้อมูล 252 วันย้อนหลังในการคำนวณ")
+                return False
+
             self.data = df
             return True
         except Exception as e:
+            st.error(f"Error fetching data: {e}")
             return False
 
-    def train_hmm(self):
-        if self.data is None: return
+   def train_hmm(self):
+        if self.data is None or self.data.empty: 
+            return
 
-        # เลือก Features ที่ "คัดเน้นๆ" ส่งให้ HMM
-        # 1. rsi: ดู Momentum
-        # 2. dist_ema200: ดู Location (สำคัญมาก! แยกดอยกับเหว)
-        # 3. atr_pct: ดู Volatility (แยกการพักตัวนิ่งๆ กับการลงแรงๆ)
-        # 4. rel_vol: ดูความผิดปกติของ Volume
-        
         feature_cols = ['rsi', 'dist_ema200', 'atr_pct', 'rel_vol']
-        X = self.data[feature_cols].values
         
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
+        # Double Check: ให้แน่ใจว่าไม่มี NaN หรือ Inf หลงเหลือใน Column ที่จะใช้
+        X_data = self.data[feature_cols].copy()
+        
+        # ถ้ายังมี NaN/Inf ให้ลบทิ้งเฉพาะจุด
+        if X_data.isnull().values.any() or np.isinf(X_data.values).any():
+            X_data = X_data.replace([np.inf, -np.inf], np.nan).dropna()
+            # update self.data ให้ index ตรงกัน
+            self.data = self.data.loc[X_data.index]
+        
+        if X_data.empty:
+            st.error("ไม่เหลือข้อมูลสำหรับ Train Model (Data Cleaned resulted in empty set)")
+            return
 
-        self.model = hmm.GaussianHMM(n_components=self.n_states, covariance_type="full", n_iter=1000, random_state=42)
-        self.model.fit(X_scaled)
-        hidden_states = self.model.predict(X_scaled)
-        self.data['state'] = hidden_states
-        self.map_smart_money_labels()
+        X = X_data.values
+        
+        try:
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X)
 
+            self.model = hmm.GaussianHMM(n_components=self.n_states, covariance_type="full", n_iter=1000, random_state=42)
+            self.model.fit(X_scaled)
+            hidden_states = self.model.predict(X_scaled)
+            self.data['state'] = hidden_states
+            self.map_smart_money_labels()
+        except Exception as e:
+            st.error(f"Error in HMM Training: {e}")
     def map_smart_money_labels(self):
         # Logic การ Map ใหม่ที่ "ฉลาดขึ้น"
         state_stats = {}
@@ -297,4 +323,5 @@ if run_btn or ticker:
 
         else:
             st.error(f"ไม่พบข้อมูลสำหรับ {ticker} กรุณาตรวจสอบชื่อย่อหุ้น")
+
 
