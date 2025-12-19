@@ -50,7 +50,7 @@ def select_ticker(ticker):
     st.session_state.selected_ticker = ticker
 
 # ==========================================
-# CLASS: Logic Core (No Volume Profile)
+# CLASS: Logic Core
 # ==========================================
 class SmartMoneyAnalyzer:
     def __init__(self, symbol, period='2y', timeframe='1d', n_states=4):
@@ -134,4 +134,74 @@ class SmartMoneyAnalyzer:
             st.error(f"Data Fetch Error: {e}")
             return False
 
-    def
+    def train_hmm(self):
+        if self.data is None or self.data.empty: return
+
+        feature_cols = ['rsi', 'dist_ema200', 'atr_pct', 'rel_vol']
+        X_data = self.data[feature_cols].copy()
+        
+        if X_data.isnull().values.any() or np.isinf(X_data.values).any():
+            X_data = X_data.replace([np.inf, -np.inf], np.nan).dropna()
+            self.data = self.data.loc[X_data.index]
+        
+        if X_data.empty: return
+
+        X = X_data.values
+        try:
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X)
+
+            self.model = hmm.GaussianHMM(n_components=self.n_states, covariance_type="full", n_iter=1000, random_state=42)
+            self.model.fit(X_scaled)
+            hidden_states = self.model.predict(X_scaled)
+            self.data['state'] = hidden_states
+            self.map_smart_money_labels()
+        except Exception as e:
+            st.error(f"Training Error: {e}")
+
+    def map_smart_money_labels(self):
+        state_stats = {}
+        for state in range(self.n_states):
+            mask = self.data['state'] == state
+            if mask.sum() == 0: continue
+            
+            state_stats[state] = {
+                'return': self.data.loc[mask, 'log_ret'].mean(),
+                'dist_ema200': self.data.loc[mask, 'dist_ema200'].mean(),
+                'id': state
+            }
+
+        stats_list = list(state_stats.values())
+        if not stats_list: return
+
+        labels = {}
+        
+        markdown_state = min(stats_list, key=lambda x: x['return'])
+        labels[markdown_state['id']] = 'Markdown (ขาลง)'
+        stats_list.remove(markdown_state)
+
+        if stats_list:
+            markup_state = max(stats_list, key=lambda x: x['return'])
+            labels[markup_state['id']] = 'Markup (ขาขึ้น)'
+            stats_list.remove(markup_state)
+
+        if stats_list:
+            sorted_by_loc = sorted(stats_list, key=lambda x: x['dist_ema200'])
+            labels[sorted_by_loc[0]['id']] = 'Accumulation (เก็บของ)'
+            if len(sorted_by_loc) > 1:
+                labels[sorted_by_loc[1]['id']] = 'Distribution (ระบายของ)'
+
+        self.data['phase'] = self.data['state'].map(labels).fillna('Uncertain')
+
+    def get_stats(self):
+        if self.data is None: return None
+        current_price = self.data['close'].iloc[-1]
+        current_phase = self.data['phase'].iloc[-1]
+        
+        total_days = len(self.data)
+        accum_days = len(self.data[self.data['phase'] == 'Accumulation (เก็บของ)'])
+        accum_pct = (accum_days / total_days) * 100
+
+        acc_mask = self.data['phase'] == 'Accumulation (เก็บของ)'
+        if acc_mask.any():
+            self.data['group'] = (self.data['phase
