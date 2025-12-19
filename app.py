@@ -32,7 +32,7 @@ st.markdown("""
 # CLASS: Logic Core (เหมือนเดิมแต่ปรับจูน)
 # ==========================================
 class SmartMoneyAnalyzer:
-    def __init__(self, symbol, period='1y', timeframe='1d', n_states=4):
+    def __init__(self, symbol, period='2y', timeframe='1d', n_states=4):
         self.symbol = symbol
         self.period = period
         self.interval = timeframe
@@ -42,8 +42,6 @@ class SmartMoneyAnalyzer:
 
     def fetch_data(self):
         try:
-            # แปลง Period/Interval ให้ตรงกับ format ของ yfinance
-            # ticker.history รองรับ interval: 1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo
             ticker = yf.Ticker(self.symbol)
             df = ticker.history(period=self.period, interval=self.interval)
             
@@ -52,26 +50,46 @@ class SmartMoneyAnalyzer:
             df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
             df.columns = ['open', 'high', 'low', 'close', 'volume']
             
-            # --- Indicators ---
-            # 1. VWAP
-            df['tp'] = (df['high'] + df['low'] + df['close']) / 3
-            df['cum_vol_price'] = (df['tp'] * df['volume']).cumsum()
-            df['cum_vol'] = df['volume'].cumsum()
-            df['vwap'] = df['cum_vol_price'] / df['cum_vol']
-
-            # 2. RSI
+            # --- 1. Basic Indicators ---
+            df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+            
+            # RSI
             delta = df['close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             rs = gain / loss
             df['rsi'] = 100 - (100 / (1 + rs))
 
-            # 3. Features for HMM
-            df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+            # --- 2. NEW: Trend & Location Features (GPS) ---
+            # Distance from EMA 200 (บอกความถูกแพง)
+            df['ema200'] = df['close'].rolling(window=200).mean()
+            df['dist_ema200'] = (df['close'] - df['ema200']) / df['ema200']
+
+            # Position in 52-week Range (บอกตำแหน่ง สูง/ต่ำ ในรอบปี)
+            df['min_52'] = df['close'].rolling(window=252).min()
+            df['max_52'] = df['close'].rolling(window=252).max()
+            df['price_pos'] = (df['close'] - df['min_52']) / (df['max_52'] - df['min_52'])
+
+            # --- 3. NEW: Volatility (Squeeze) ---
+            # ATR Normalized (บอกความนิ่ง)
+            df['tr'] = np.maximum(df['high'] - df['low'], 
+                                  np.maximum(abs(df['high'] - df['close'].shift(1)), 
+                                             abs(df['low'] - df['close'].shift(1))))
+            df['atr'] = df['tr'].rolling(window=14).mean()
+            df['atr_pct'] = df['atr'] / df['close']
+
+            # --- 4. NEW: Volume Quality ---
+            # Relative Volume
             df['vol_ma'] = df['volume'].rolling(window=20).mean()
             df['rel_vol'] = df['volume'] / df['vol_ma']
-            df['dist_vwap'] = (df['close'] - df['vwap']) / df['vwap']
 
+            # VWAP Calculation (สำหรับแสดงผล)
+            df['tp'] = (df['high'] + df['low'] + df['close']) / 3
+            df['cum_vol_price'] = (df['tp'] * df['volume']).cumsum()
+            df['cum_vol'] = df['volume'].cumsum()
+            df['vwap'] = df['cum_vol_price'] / df['cum_vol']
+
+            # Drop NaN (ระวัง: EMA200 ทำให้ข้อมูลหายไป 200 วันแรก)
             df.dropna(inplace=True)
             self.data = df
             return True
@@ -81,8 +99,15 @@ class SmartMoneyAnalyzer:
     def train_hmm(self):
         if self.data is None: return
 
-        # Features: RSI, Relative Volume, Log Return
-        X = self.data[['rsi', 'rel_vol', 'log_ret']].values
+        # เลือก Features ที่ "คัดเน้นๆ" ส่งให้ HMM
+        # 1. rsi: ดู Momentum
+        # 2. dist_ema200: ดู Location (สำคัญมาก! แยกดอยกับเหว)
+        # 3. atr_pct: ดู Volatility (แยกการพักตัวนิ่งๆ กับการลงแรงๆ)
+        # 4. rel_vol: ดูความผิดปกติของ Volume
+        
+        feature_cols = ['rsi', 'dist_ema200', 'atr_pct', 'rel_vol']
+        X = self.data[feature_cols].values
+        
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
 
@@ -90,59 +115,64 @@ class SmartMoneyAnalyzer:
         self.model.fit(X_scaled)
         hidden_states = self.model.predict(X_scaled)
         self.data['state'] = hidden_states
-        self.map_thai_labels()
+        self.map_smart_money_labels()
 
-    def map_thai_labels(self):
-        # Logic การ Map State (Simplified)
+    def map_smart_money_labels(self):
+        # Logic การ Map ใหม่ที่ "ฉลาดขึ้น"
         state_stats = {}
         for state in range(self.n_states):
             mask = self.data['state'] == state
             if mask.sum() == 0: continue
+            
             state_stats[state] = {
-                'return': self.data.loc[mask, 'log_ret'].mean(),
-                'rsi': self.data.loc[mask, 'rsi'].mean()
+                'rsi': self.data.loc[mask, 'rsi'].mean(),
+                'dist_ema200': self.data.loc[mask, 'dist_ema200'].mean(), # ค่าลบ = ใต้เส้น 200 (ถูก), ค่าบวก = เหนือเส้น (แพง)
+                'atr': self.data.loc[mask, 'atr_pct'].mean(), # ต่ำ = นิ่ง, สูง = เหวี่ยง
+                'return': self.data.loc[mask, 'log_ret'].mean()
             }
-        
-        # Sort by Return to guess phases
-        sorted_states = sorted(state_stats.items(), key=lambda x: x[1]['return'])
-        
-        # Mapping logic
-        labels = {}
-        # Return ต่ำสุด = Markdown (ขาลง)
-        labels[sorted_states[0][0]] = 'Markdown (ขาลง)'
-        # Return สูงสุด = Markup (ขาขึ้น)
-        labels[sorted_states[-1][0]] = 'Markup (ขาขึ้น)'
-        
-        # เหลือตรงกลาง
-        middle = sorted_states[1:-1]
-        if len(middle) >= 2:
-            # RSI ต่ำกว่า = Accumulation (เก็บของ)
-            if middle[0][1]['rsi'] < middle[1][1]['rsi']:
-                labels[middle[0][0]] = 'Accumulation (เก็บของ)'
-                labels[middle[1][0]] = 'Distribution (ระบายของ)'
-            else:
-                labels[middle[0][0]] = 'Distribution (ระบายของ)'
-                labels[middle[1][0]] = 'Accumulation (เก็บของ)'
-        elif len(middle) == 1:
-            labels[middle[0][0]] = 'Accumulation (เก็บของ)'
 
-        self.data['phase'] = self.data['state'].map(labels)
+        # การให้คะแนนเพื่อระบุ Phase (Scoring System)
+        labels = {}
+        for state, stats in state_stats.items():
+            # กฎเหล็ก: Accumulation ต้องอยู่โซนล่าง และ นิ่ง
+            if stats['dist_ema200'] < 0.05 and stats['atr'] < stats['atr'] * 1.2: 
+                # ถ้าราคาอยู่ใต้ EMA200 หรือเหนือกว่านิดหน่อย และไม่ผันผวนมาก
+                if stats['rsi'] < 55:
+                    labels[state] = 'Accumulation (เก็บของ)'
+                else:
+                    labels[state] = 'Re-Accumulation / Base (พักตัว)'
+            
+            # กฎเหล็ก: Distribution มักอยู่โซนบน หรือ ผันผวนจัดๆ
+            elif stats['dist_ema200'] > 0.10: # อยู่เหนือเส้น 200 เกิน 10%
+                if stats['rsi'] > 60:
+                    labels[state] = 'Distribution (ระบายของ)'
+                else:
+                    labels[state] = 'Markup (ขาขึ้น)'
+            
+            # ถ้าไม่เข้าพวก ดู Return
+            else:
+                if stats['return'] < -0.001:
+                    labels[state] = 'Markdown (ขาลง)'
+                else:
+                    labels[state] = 'Markup (ขาขึ้น)'
+
+        self.data['phase'] = self.data['state'].map(labels).fillna('Uncertain')
 
     def get_stats(self):
+        # (คงเดิม หรือปรับตามต้องการ)
         if self.data is None: return None
-        
         current_price = self.data['close'].iloc[-1]
         current_phase = self.data['phase'].iloc[-1]
         
-        # หา VWAP ของช่วง Accumulation ล่าสุด
+        # หา VWAP ของกลุ่ม Accumulation ล่าสุด
         acc_mask = self.data['phase'] == 'Accumulation (เก็บของ)'
         if acc_mask.any():
-            # กรองเอาเฉพาะช่วง Accumulation ท้ายสุด
             self.data['group'] = (self.data['phase'] != self.data['phase'].shift()).cumsum()
-            last_group = self.data[acc_mask]['group'].iloc[-1]
+            # กรองเฉพาะช่วงที่พึ่งเกิดเร็วๆนี้ (ไม่เอาเก่าเกิน 1 ปี)
+            recent_groups = self.data[acc_mask]['group'].unique()
+            last_group = recent_groups[-1]
             last_acc_data = self.data[self.data['group'] == last_group]
             
-            # คำนวณ VWAP ในช่วงนั้น
             sm_vwap = (last_acc_data['close'] * last_acc_data['volume']).sum() / last_acc_data['volume'].sum()
         else:
             sm_vwap = None
@@ -267,3 +297,4 @@ if run_btn or ticker:
 
         else:
             st.error(f"ไม่พบข้อมูลสำหรับ {ticker} กรุณาตรวจสอบชื่อย่อหุ้น")
+
