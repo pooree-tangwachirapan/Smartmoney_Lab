@@ -161,36 +161,62 @@ class SmartMoneyAnalyzer:
             st.error(f"Training Error: {e}")
 
     def map_smart_money_labels(self):
+        # 1. คำนวณสถิติของแต่ละ State เพื่อดูพฤติกรรม
         state_stats = {}
         for state in range(self.n_states):
             mask = self.data['state'] == state
             if mask.sum() == 0: continue
             
             state_stats[state] = {
+                'return': self.data.loc[mask, 'log_ret'].mean(),
                 'rsi': self.data.loc[mask, 'rsi'].mean(),
                 'dist_ema200': self.data.loc[mask, 'dist_ema200'].mean(),
-                'atr': self.data.loc[mask, 'atr_pct'].mean(),
-                'return': self.data.loc[mask, 'log_ret'].mean()
+                'atr_pct': self.data.loc[mask, 'atr_pct'].mean(),
+                'id': state
             }
 
+        # แปลงเป็น List เพื่อจัดอันดับ
+        stats_list = list(state_stats.values())
+        
+        # กรณี HMM แยก State ออกมาได้ไม่ครบ 4 (กัน Error)
+        if not stats_list: return
+
+        # 2. เริ่มจัดอันดับ (Ranking Logic)
         labels = {}
-        for state, stats in state_stats.items():
-            # Logic แยก Phase (Accumulation ต้องอยู่โซนล่าง + นิ่ง)
-            if stats['dist_ema200'] < 0.05 and stats['atr'] < stats['atr'] * 1.3:
-                if stats['rsi'] < 55:
-                    labels[state] = 'Accumulation (เก็บของ)'
-                else:
-                    labels[state] = 'Re-Accumulation (พักตัว)'
-            elif stats['dist_ema200'] > 0.10:
-                if stats['rsi'] > 60:
-                    labels[state] = 'Distribution (ระบายของ)'
-                else:
-                    labels[state] = 'Markup (ขาขึ้น)'
-            else:
-                if stats['return'] < -0.001:
-                    labels[state] = 'Markdown (ขาลง)'
-                else:
-                    labels[state] = 'Markup (ขาขึ้น)'
+        
+        # --- หา Markdown (ขาลง) ---
+        # คือ State ที่ Return ต่ำที่สุด (ติดลบมากสุด)
+        markdown_state = min(stats_list, key=lambda x: x['return'])
+        labels[markdown_state['id']] = 'Markdown (ขาลง)'
+        stats_list.remove(markdown_state)
+
+        # --- หา Markup (ขาขึ้น) ---
+        # คือ State ที่ Return สูงที่สุด (ในกลุ่มที่เหลือ)
+        if stats_list:
+            markup_state = max(stats_list, key=lambda x: x['return'])
+            labels[markup_state['id']] = 'Markup (ขาขึ้น)'
+            stats_list.remove(markup_state)
+
+        # --- แยก Accumulation vs Distribution (กลุ่มที่เหลือ) ---
+        # ตอนนี้จะเหลือ 1 หรือ 2 states ที่เป็นช่วง Sideway
+        # เราจะแยกด้วย "ตำแหน่งราคา (Location)" และ "ความผันผวน (Volatility)"
+        
+        if stats_list:
+            # เรียงตามระยะห่าง EMA200 (น้อยไปมาก)
+            # ตัวที่อยู่ต่ำกว่า (Low Location) มีโอกาสเป็น Accumulation มากกว่า
+            sorted_by_loc = sorted(stats_list, key=lambda x: x['dist_ema200'])
+            
+            accum_candidate = sorted_by_loc[0] # ตัวที่อยู่ต่ำสุด
+            
+            # เช็คเงื่อนไขเสริม: Accumulation ควรนิ่ง (ATR ต่ำ)
+            # ถ้าตัวที่ต่ำสุด ดันผันผวนสูงกว่าอีกตัว อาจจะเป็น Panic Sell (Markdown ประเภท 2)
+            # แต่ใน Logic ง่ายๆ ให้ Location เป็นพระเอก
+            labels[accum_candidate['id']] = 'Accumulation (เก็บของ)'
+            
+            # ถ้ายังมีเหลืออีกตัว คือ Distribution
+            if len(sorted_by_loc) > 1:
+                dist_candidate = sorted_by_loc[1]
+                labels[dist_candidate['id']] = 'Distribution (ระบายของ)'
 
         self.data['phase'] = self.data['state'].map(labels).fillna('Uncertain')
 
@@ -338,3 +364,4 @@ if run_btn or ticker_input != st.session_state.get('last_run_ticker', ''):
 
         else:
             st.error(f"ไม่พบข้อมูลสำหรับ {ticker_input} กรุณาตรวจสอบชื่อหุ้น")
+
