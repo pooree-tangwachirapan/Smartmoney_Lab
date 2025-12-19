@@ -15,22 +15,20 @@ warnings.filterwarnings('ignore')
 st.set_page_config(page_title="AI Smart Money Analysis", layout="wide")
 
 # ==========================================
-# CSS Styles (ปรับแต่ง UI)
+# CSS Styles
 # ==========================================
 st.markdown("""
 <style>
     .metric-label { font-size: 14px; color: #666; }
     .metric-value { font-size: 32px; font-weight: bold; }
     .stMetric { background-color: #ffffff; padding: 10px; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    
-    /* ปรับหัวข้อชื่อหุ้น */
     .stock-title { font-size: 36px; font-weight: 800; color: #1E1E1E; margin-bottom: 0px; }
     .stock-subtitle { font-size: 18px; color: #666; margin-top: -5px; margin-bottom: 20px; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# SESSION STATE (ระบบจำค่า Portfolio)
+# SESSION STATE
 # ==========================================
 if 'portfolio' not in st.session_state:
     st.session_state.portfolio = ['^GSPC', 'BTC-USD', '^VIX', '^NDX', 'GC=F']
@@ -52,7 +50,7 @@ def select_ticker(ticker):
     st.session_state.selected_ticker = ticker
 
 # ==========================================
-# CLASS: Logic Core (Version 4.0: Name + Ranking)
+# CLASS: Logic Core (Update: BB + Vol Profile)
 # ==========================================
 class SmartMoneyAnalyzer:
     def __init__(self, symbol, period='2y', timeframe='1d', n_states=4):
@@ -62,20 +60,16 @@ class SmartMoneyAnalyzer:
         self.n_states = n_states
         self.data = None
         self.model = None
-        self.asset_name = symbol # Default เป็นชื่อย่อก่อน
+        self.asset_name = symbol
 
     def fetch_data(self):
         try:
             ticker = yf.Ticker(self.symbol)
-            
-            # --- ส่วนที่เพิ่ม: ดึงชื่อเต็มสินทรัพย์ ---
             try:
-                # พยายามดึงชื่อจาก info (อาจจะช้านิดนึงในบางครั้ง)
                 info = ticker.info
                 self.asset_name = info.get('longName') or info.get('shortName') or info.get('name') or self.symbol
             except:
                 self.asset_name = self.symbol
-            # -------------------------------------
 
             df = ticker.history(period=self.period, interval=self.interval)
             
@@ -93,6 +87,12 @@ class SmartMoneyAnalyzer:
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             rs = gain / loss
             df['rsi'] = 100 - (100 / (1 + rs))
+
+            # Bollinger Bands (NEW)
+            df['bb_mean'] = df['close'].rolling(window=20).mean()
+            df['bb_std'] = df['close'].rolling(window=20).std()
+            df['bb_upper'] = df['bb_mean'] + (2 * df['bb_std'])
+            df['bb_lower'] = df['bb_mean'] - (2 * df['bb_std'])
 
             # Trend & Location
             df['ema200'] = df['close'].rolling(window=200).mean()
@@ -160,7 +160,6 @@ class SmartMoneyAnalyzer:
             st.error(f"Training Error: {e}")
 
     def map_smart_money_labels(self):
-        # ใช้ Logic Ranking System (เปรียบเทียบในตัวเอง)
         state_stats = {}
         for state in range(self.n_states):
             mask = self.data['state'] == state
@@ -177,25 +176,18 @@ class SmartMoneyAnalyzer:
 
         labels = {}
         
-        # 1. Markdown (Return ต่ำสุด)
         markdown_state = min(stats_list, key=lambda x: x['return'])
         labels[markdown_state['id']] = 'Markdown (ขาลง)'
         stats_list.remove(markdown_state)
 
-        # 2. Markup (Return สูงสุด)
         if stats_list:
             markup_state = max(stats_list, key=lambda x: x['return'])
             labels[markup_state['id']] = 'Markup (ขาขึ้น)'
             stats_list.remove(markup_state)
 
-        # 3. Accumulation vs Distribution (Sideway ที่เหลือ)
         if stats_list:
-            # เรียงตาม Location (EMA200)
             sorted_by_loc = sorted(stats_list, key=lambda x: x['dist_ema200'])
-            
-            # ตัวที่อยู่ต่ำกว่า = Accumulation
             labels[sorted_by_loc[0]['id']] = 'Accumulation (เก็บของ)'
-            
             if len(sorted_by_loc) > 1:
                 labels[sorted_by_loc[1]['id']] = 'Distribution (ระบายของ)'
 
@@ -206,6 +198,11 @@ class SmartMoneyAnalyzer:
         current_price = self.data['close'].iloc[-1]
         current_phase = self.data['phase'].iloc[-1]
         
+        # Accumulation % Calculation
+        total_days = len(self.data)
+        accum_days = len(self.data[self.data['phase'] == 'Accumulation (เก็บของ)'])
+        accum_pct = (accum_days / total_days) * 100
+
         acc_mask = self.data['phase'] == 'Accumulation (เก็บของ)'
         if acc_mask.any():
             self.data['group'] = (self.data['phase'] != self.data['phase'].shift()).cumsum()
@@ -217,14 +214,26 @@ class SmartMoneyAnalyzer:
         else:
             sm_vwap = None
 
-        return current_price, current_phase, sm_vwap
+        return current_price, current_phase, sm_vwap, accum_pct
+
+    def get_volume_profile(self, bins=30):
+        # คำนวณ Volume Profile (Histogram of Volume by Price)
+        price_min = self.data['close'].min()
+        price_max = self.data['close'].max()
+        price_range = np.linspace(price_min, price_max, bins)
+        
+        # ใช้ numpy histogram เพื่อรวม volume ในแต่ละช่วงราคา
+        vol_hist, bin_edges = np.histogram(self.data['close'], bins=bins, weights=self.data['volume'])
+        
+        # หาจุดกึ่งกลางของแต่ละ bin เพื่อใช้ plot
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        return bin_centers, vol_hist
 
 # ==========================================
 # UI: SIDEBAR PORTFOLIO
 # ==========================================
 with st.sidebar:
     st.title("💼 Portfolio")
-    
     with st.expander("➕ เพิ่มหุ้น", expanded=True):
         st.text_input("ชื่อหุ้น (เช่น TSLA)", key="new_ticker_input", on_change=add_ticker)
 
@@ -243,7 +252,6 @@ with st.sidebar:
 # ==========================================
 # UI: MAIN CONTENT
 # ==========================================
-# Input Bar
 with st.container():
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
     with c1:
@@ -262,27 +270,30 @@ if run_btn or ticker_input != st.session_state.get('last_run_ticker', ''):
 
     analyzer = SmartMoneyAnalyzer(ticker_input, period, timeframe)
     
-    with st.spinner('กำลังโหลดข้อมูลและวิเคราะห์...'):
+    with st.spinner('กำลังวิเคราะห์...'):
         if analyzer.fetch_data():
             analyzer.train_hmm()
             df = analyzer.data
-            price, phase, sm_vwap = analyzer.get_stats()
+            price, phase, sm_vwap, accum_pct = analyzer.get_stats()
 
-            # --- HEADER: แสดงชื่อหุ้น ---
+            # HEADER
             st.markdown(f'<p class="stock-title">{analyzer.asset_name}</p>', unsafe_allow_html=True)
             st.markdown(f'<p class="stock-subtitle">Symbol: {ticker_input.upper()} • Timeframe: {timeframe}</p>', unsafe_allow_html=True)
 
-            # --- METRICS ---
-            m1, m2, m3 = st.columns([1, 1.5, 1.5])
+            # METRICS (เพิ่ม % Accumulation)
+            m1, m2, m3, m4 = st.columns(4)
             with m1:
                 st.metric("ราคาตลาด", f"${price:,.2f}")
             with m2:
                 if sm_vwap:
                     diff_pct = ((price - sm_vwap) / sm_vwap) * 100
-                    st.metric("ต้นทุนเจ้ามือ (Accum VWAP)", f"${sm_vwap:,.2f}", f"{diff_pct:.2f}% vs Market")
+                    st.metric("ต้นทุนเจ้ามือ (VWAP)", f"${sm_vwap:,.2f}", f"{diff_pct:.2f}%")
                 else:
-                    st.metric("ต้นทุนเจ้ามือ", "N/A", "ไม่พบข้อมูลเก็บของ")
+                    st.metric("ต้นทุนเจ้ามือ", "N/A", "ไม่พบข้อมูล")
             with m3:
+                # แสดง % Accumulation
+                st.metric("% เวลาเก็บของ", f"{accum_pct:.1f}%", help="เปอร์เซ็นต์ของช่วงเวลาทั้งหมดที่อยู่ในสถานะ Accumulation")
+            with m4:
                 color_map = {
                     'Accumulation (เก็บของ)': '#00C805', 
                     'Markup (ขาขึ้น)': '#0066FF',
@@ -292,42 +303,74 @@ if run_btn or ticker_input != st.session_state.get('last_run_ticker', ''):
                 phase_color = color_map.get(phase, 'black')
                 st.markdown(f"""
                 <div style="font-size: 14px; color: #666;">สถานะตลาด:</div>
-                <div style="font-size: 24px; font-weight: bold; color: {phase_color};">{phase}</div>
+                <div style="font-size: 20px; font-weight: bold; color: {phase_color};">{phase}</div>
                 """, unsafe_allow_html=True)
 
             st.markdown("---")
 
-            # --- CHART ---
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                                vertical_spacing=0.05, row_heights=[0.7, 0.3])
+            # CHART (Main Price + Volume Profile Side-by-Side)
+            # แบ่งคอลัมน์: กราฟหลัก 80%, Volume Profile 20%
+            
+            # เตรียมข้อมูล Volume Profile
+            vp_prices, vp_volumes = analyzer.get_volume_profile(bins=50)
 
-            fig.add_trace(go.Scatter(
-                x=df.index, y=df['close'], mode='lines',
-                line=dict(color='lightgray', width=1), name='Price'
-            ), row=1, col=1)
+            fig = make_subplots(
+                rows=2, cols=2, 
+                shared_xaxes=True,
+                column_widths=[0.8, 0.2],
+                row_heights=[0.7, 0.3],
+                vertical_spacing=0.05,
+                horizontal_spacing=0.02,
+                specs=[[{"secondary_y": False}, {"rowspan": 2}], # Row 1: Price Chart, Volume Profile (ยาวลงมา)
+                       [{"secondary_y": False}, None]]             # Row 2: RSI, (พื้นที่ว่างเพราะ VP กินที่)
+            )
 
+            # 1. Price Chart (Row 1, Col 1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['close'], mode='lines', line=dict(color='gray', width=1), name='Price'), row=1, col=1)
+            
+            # Add Bollinger Bands
+            fig.add_trace(go.Scatter(x=df.index, y=df['bb_upper'], mode='lines', line=dict(color='rgba(0,0,255,0.2)', width=1, dash='dot'), name='BB Upper'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['bb_lower'], mode='lines', line=dict(color='rgba(0,0,255,0.2)', width=1, dash='dot'), fill='tonexty', fillcolor='rgba(0,0,255,0.05)', name='BB Lower'), row=1, col=1)
+
+            # Colored Dots
             phases_order = ['Accumulation (เก็บของ)', 'Markup (ขาขึ้น)', 'Distribution (ระบายของ)', 'Markdown (ขาลง)']
             colors_list = ['#00C805', '#0066FF', '#FF9900', '#FF3333']
-            
             for p_name, p_color in zip(phases_order, colors_list):
                 subset = df[df['phase'] == p_name]
                 if not subset.empty:
-                    fig.add_trace(go.Scatter(
-                        x=subset.index, y=subset['close'],
-                        mode='markers', marker=dict(color=p_color, size=4),
-                        name=p_name
-                    ), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=subset.index, y=subset['close'], mode='markers', marker=dict(color=p_color, size=4), name=p_name), row=1, col=1)
 
+            # 2. RSI (Row 2, Col 1)
             fig.add_trace(go.Scatter(x=df.index, y=df['rsi'], line=dict(color='#9370DB', width=1.5), name='RSI'), row=2, col=1)
             fig.add_hline(y=70, line_dash="dot", line_color="gray", row=2, col=1)
             fig.add_hline(y=30, line_dash="dot", line_color="gray", row=2, col=1)
 
-            fig.update_layout(height=600, template='plotly_white', margin=dict(l=20, r=20, t=10, b=20),
-                              hovermode="x unified", title_text="")
-            
+            # 3. Volume Profile (Row 1-2, Col 2) - Horizontal Bar
+            fig.add_trace(go.Bar(
+                x=vp_volumes, 
+                y=vp_prices, 
+                orientation='h', 
+                marker_color='rgba(100, 100, 100, 0.4)',
+                name='Volume Profile'
+            ), row=1, col=2)
+
+            # Layout Settings
+            fig.update_layout(
+                height=650, 
+                template='plotly_white', 
+                margin=dict(l=10, r=10, t=10, b=10),
+                hovermode="x unified",
+                showlegend=False
+            )
+            # Remove axes for Volume Profile to look clean
+            fig.update_xaxes(showticklabels=False, row=1, col=2)
+            fig.update_yaxes(showticklabels=False, row=1, col=2) # ซ่อนราคาแกน Y ของ VP เพราะมันตรงกับกราฟหลักอยู่แล้ว
+
             st.plotly_chart(fig, use_container_width=True)
+
+            # Data Table
+            with st.expander("ดูข้อมูลดิบ (Raw Data)"):
+                st.dataframe(df.tail(100))
 
         else:
             st.error(f"ไม่พบข้อมูลสำหรับ {ticker_input}")
-
-
