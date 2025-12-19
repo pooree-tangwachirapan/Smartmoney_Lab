@@ -33,7 +33,7 @@ st.markdown("""
 # SESSION STATE (ระบบจำค่า Portfolio)
 # ==========================================
 if 'portfolio' not in st.session_state:
-    st.session_state.portfolio = ['^GSPC', 'BTC-USD', 'VIX', 'NQ=F', 'GC=F']
+    st.session_state.portfolio = ['^GSPC', 'BTC-USD', '^VIX', '^NDX', 'GC=F']
 
 if 'selected_ticker' not in st.session_state:
     st.session_state.selected_ticker = '^GSPC'
@@ -329,4 +329,5 @@ if run_btn or ticker_input != st.session_state.get('last_run_ticker', ''):
 
         else:
             st.error(f"ไม่พบข้อมูลสำหรับ {ticker_input}")
+
 
