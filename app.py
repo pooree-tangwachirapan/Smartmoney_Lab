@@ -21,12 +21,11 @@ st.markdown("""
 <style>
     .metric-label { font-size: 14px; color: #666; }
     .metric-value { font-size: 32px; font-weight: bold; }
-    .stMetric { background-color: #ffffff; padding: 10px; border-radius: 5px; }
+    .stMetric { background-color: #ffffff; padding: 10px; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
     
-    /* ปรับแต่งปุ่มใน Portfolio */
-    div.stButton > button:first-child {
-        border-radius: 5px;
-    }
+    /* ปรับหัวข้อชื่อหุ้น */
+    .stock-title { font-size: 36px; font-weight: 800; color: #1E1E1E; margin-bottom: 0px; }
+    .stock-subtitle { font-size: 18px; color: #666; margin-top: -5px; margin-bottom: 20px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -34,29 +33,26 @@ st.markdown("""
 # SESSION STATE (ระบบจำค่า Portfolio)
 # ==========================================
 if 'portfolio' not in st.session_state:
-    st.session_state.portfolio = ['BTC-USD', '^GSPC', 'VIX', 'GC=F', 'NQ=F'] # ค่าเริ่มต้น
+    st.session_state.portfolio = ['BTC-USD', 'TSLA', 'NVDA', 'AMD', 'GC=F']
 
 if 'selected_ticker' not in st.session_state:
-    st.session_state.selected_ticker = '^GSPC'
+    st.session_state.selected_ticker = 'BTC-USD'
 
-# ฟังก์ชันสำหรับเพิ่มหุ้น
 def add_ticker():
     new_ticker = st.session_state.new_ticker_input.upper().strip()
     if new_ticker and new_ticker not in st.session_state.portfolio:
         st.session_state.portfolio.append(new_ticker)
-        st.session_state.new_ticker_input = "" # Clear input
+        st.session_state.new_ticker_input = ""
 
-# ฟังก์ชันสำหรับลบหุ้น
 def delete_ticker(ticker):
     if ticker in st.session_state.portfolio:
         st.session_state.portfolio.remove(ticker)
 
-# ฟังก์ชันเมื่อกดเลือกหุ้นจากลิสต์
 def select_ticker(ticker):
     st.session_state.selected_ticker = ticker
 
 # ==========================================
-# CLASS: Logic Core (พร้อม Fix Bug Dirty Data)
+# CLASS: Logic Core (Version 4.0: Name + Ranking)
 # ==========================================
 class SmartMoneyAnalyzer:
     def __init__(self, symbol, period='2y', timeframe='1d', n_states=4):
@@ -66,10 +62,21 @@ class SmartMoneyAnalyzer:
         self.n_states = n_states
         self.data = None
         self.model = None
+        self.asset_name = symbol # Default เป็นชื่อย่อก่อน
 
     def fetch_data(self):
         try:
             ticker = yf.Ticker(self.symbol)
+            
+            # --- ส่วนที่เพิ่ม: ดึงชื่อเต็มสินทรัพย์ ---
+            try:
+                # พยายามดึงชื่อจาก info (อาจจะช้านิดนึงในบางครั้ง)
+                info = ticker.info
+                self.asset_name = info.get('longName') or info.get('shortName') or info.get('name') or self.symbol
+            except:
+                self.asset_name = self.symbol
+            # -------------------------------------
+
             df = ticker.history(period=self.period, interval=self.interval)
             
             if df.empty: return False
@@ -77,8 +84,7 @@ class SmartMoneyAnalyzer:
             df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
             df.columns = ['open', 'high', 'low', 'close', 'volume']
             
-            # --- Indicators Calculation ---
-            # ใช้ log1p หรือจัดการ 0 ป้องกัน Infinity
+            # --- Indicators ---
             df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
             
             # RSI
@@ -88,24 +94,23 @@ class SmartMoneyAnalyzer:
             rs = gain / loss
             df['rsi'] = 100 - (100 / (1 + rs))
 
-            # Trend & Location (EMA200 & Price Position)
+            # Trend & Location
             df['ema200'] = df['close'].rolling(window=200).mean()
             df['dist_ema200'] = (df['close'] - df['ema200']) / df['ema200']
 
             df['min_52'] = df['close'].rolling(window=252).min()
             df['max_52'] = df['close'].rolling(window=252).max()
             denom = df['max_52'] - df['min_52']
-            # ป้องกันหารด้วย 0
             df['price_pos'] = np.where(denom == 0, 0, (df['close'] - df['min_52']) / denom)
 
-            # Volatility (ATR%)
+            # Volatility
             df['tr'] = np.maximum(df['high'] - df['low'], 
                                   np.maximum(abs(df['high'] - df['close'].shift(1)), 
                                              abs(df['low'] - df['close'].shift(1))))
             df['atr'] = df['tr'].rolling(window=14).mean()
             df['atr_pct'] = df['atr'] / df['close']
 
-            # Relative Volume
+            # Volume
             df['vol_ma'] = df['volume'].rolling(window=20).mean()
             df['rel_vol'] = np.where(df['vol_ma'] == 0, 0, df['volume'] / df['vol_ma'])
 
@@ -115,14 +120,10 @@ class SmartMoneyAnalyzer:
             df['cum_vol'] = df['volume'].cumsum()
             df['vwap'] = np.where(df['cum_vol'] == 0, df['tp'], df['cum_vol_price'] / df['cum_vol'])
 
-            # === DATA CLEANING (FIX CRASH) ===
-            # 1. แทนค่า Infinity ด้วย NaN
+            # Clean Data
             df.replace([np.inf, -np.inf], np.nan, inplace=True)
-            
-            # 2. ลบแถวที่มี NaN (ข้อมูลช่วงต้นจะหายไปเพราะ Indicator)
             df.dropna(inplace=True)
 
-            # 3. เช็คจำนวนข้อมูล
             if len(df) < 50:
                 st.error(f"ข้อมูลไม่เพียงพอ ({len(df)} วัน) กรุณาใช้ Period '2y' หรือ '5y'")
                 return False
@@ -136,11 +137,9 @@ class SmartMoneyAnalyzer:
     def train_hmm(self):
         if self.data is None or self.data.empty: return
 
-        # Features ที่คัดมาแล้ว
         feature_cols = ['rsi', 'dist_ema200', 'atr_pct', 'rel_vol']
-        
-        # Double Check NaN/Inf ก่อนเข้า Model
         X_data = self.data[feature_cols].copy()
+        
         if X_data.isnull().values.any() or np.isinf(X_data.values).any():
             X_data = X_data.replace([np.inf, -np.inf], np.nan).dropna()
             self.data = self.data.loc[X_data.index]
@@ -161,7 +160,7 @@ class SmartMoneyAnalyzer:
             st.error(f"Training Error: {e}")
 
     def map_smart_money_labels(self):
-        # 1. คำนวณสถิติของแต่ละ State เพื่อดูพฤติกรรม
+        # ใช้ Logic Ranking System (เปรียบเทียบในตัวเอง)
         state_stats = {}
         for state in range(self.n_states):
             mask = self.data['state'] == state
@@ -169,54 +168,36 @@ class SmartMoneyAnalyzer:
             
             state_stats[state] = {
                 'return': self.data.loc[mask, 'log_ret'].mean(),
-                'rsi': self.data.loc[mask, 'rsi'].mean(),
                 'dist_ema200': self.data.loc[mask, 'dist_ema200'].mean(),
-                'atr_pct': self.data.loc[mask, 'atr_pct'].mean(),
                 'id': state
             }
 
-        # แปลงเป็น List เพื่อจัดอันดับ
         stats_list = list(state_stats.values())
-        
-        # กรณี HMM แยก State ออกมาได้ไม่ครบ 4 (กัน Error)
         if not stats_list: return
 
-        # 2. เริ่มจัดอันดับ (Ranking Logic)
         labels = {}
         
-        # --- หา Markdown (ขาลง) ---
-        # คือ State ที่ Return ต่ำที่สุด (ติดลบมากสุด)
+        # 1. Markdown (Return ต่ำสุด)
         markdown_state = min(stats_list, key=lambda x: x['return'])
         labels[markdown_state['id']] = 'Markdown (ขาลง)'
         stats_list.remove(markdown_state)
 
-        # --- หา Markup (ขาขึ้น) ---
-        # คือ State ที่ Return สูงที่สุด (ในกลุ่มที่เหลือ)
+        # 2. Markup (Return สูงสุด)
         if stats_list:
             markup_state = max(stats_list, key=lambda x: x['return'])
             labels[markup_state['id']] = 'Markup (ขาขึ้น)'
             stats_list.remove(markup_state)
 
-        # --- แยก Accumulation vs Distribution (กลุ่มที่เหลือ) ---
-        # ตอนนี้จะเหลือ 1 หรือ 2 states ที่เป็นช่วง Sideway
-        # เราจะแยกด้วย "ตำแหน่งราคา (Location)" และ "ความผันผวน (Volatility)"
-        
+        # 3. Accumulation vs Distribution (Sideway ที่เหลือ)
         if stats_list:
-            # เรียงตามระยะห่าง EMA200 (น้อยไปมาก)
-            # ตัวที่อยู่ต่ำกว่า (Low Location) มีโอกาสเป็น Accumulation มากกว่า
+            # เรียงตาม Location (EMA200)
             sorted_by_loc = sorted(stats_list, key=lambda x: x['dist_ema200'])
             
-            accum_candidate = sorted_by_loc[0] # ตัวที่อยู่ต่ำสุด
+            # ตัวที่อยู่ต่ำกว่า = Accumulation
+            labels[sorted_by_loc[0]['id']] = 'Accumulation (เก็บของ)'
             
-            # เช็คเงื่อนไขเสริม: Accumulation ควรนิ่ง (ATR ต่ำ)
-            # ถ้าตัวที่ต่ำสุด ดันผันผวนสูงกว่าอีกตัว อาจจะเป็น Panic Sell (Markdown ประเภท 2)
-            # แต่ใน Logic ง่ายๆ ให้ Location เป็นพระเอก
-            labels[accum_candidate['id']] = 'Accumulation (เก็บของ)'
-            
-            # ถ้ายังมีเหลืออีกตัว คือ Distribution
             if len(sorted_by_loc) > 1:
-                dist_candidate = sorted_by_loc[1]
-                labels[dist_candidate['id']] = 'Distribution (ระบายของ)'
+                labels[sorted_by_loc[1]['id']] = 'Distribution (ระบายของ)'
 
         self.data['phase'] = self.data['state'].map(labels).fillna('Uncertain')
 
@@ -225,12 +206,10 @@ class SmartMoneyAnalyzer:
         current_price = self.data['close'].iloc[-1]
         current_phase = self.data['phase'].iloc[-1]
         
-        # VWAP จากช่วง Accumulation ล่าสุด
         acc_mask = self.data['phase'] == 'Accumulation (เก็บของ)'
         if acc_mask.any():
             self.data['group'] = (self.data['phase'] != self.data['phase'].shift()).cumsum()
             recent_groups = self.data[acc_mask]['group'].unique()
-            # เอาช่วงล่าสุด
             last_group = recent_groups[-1]
             last_acc_data = self.data[self.data['group'] == last_group]
             
@@ -246,40 +225,29 @@ class SmartMoneyAnalyzer:
 with st.sidebar:
     st.title("💼 Portfolio")
     
-    # Input เพิ่มหุ้น
-    with st.expander("➕ เพิ่มหุ้นเข้าพอร์ต", expanded=True):
-        st.text_input("ชื่อหุ้น (เช่น NVDA)", key="new_ticker_input", on_change=add_ticker)
-        st.caption("กด Enter เพื่อเพิ่ม")
+    with st.expander("➕ เพิ่มหุ้น", expanded=True):
+        st.text_input("ชื่อหุ้น (เช่น TSLA)", key="new_ticker_input", on_change=add_ticker)
 
     st.markdown("---")
-    st.subheader("รายการหุ้นที่บันทึกไว้")
-
-    # วนลูปแสดงรายชื่อหุ้น
+    
     for ticker in st.session_state.portfolio:
         col1, col2 = st.columns([3, 1])
-        
         with col1:
-            # ปุ่มชื่อหุ้น กดแล้วเลือกวิเคราะห์เลย
-            if st.button(f"🔍 {ticker}", key=f"btn_{ticker}", use_container_width=True):
+            if st.button(f"📊 {ticker}", key=f"btn_{ticker}", use_container_width=True):
                 select_ticker(ticker)
-                
         with col2:
-            # ปุ่มลบ
-            if st.button("🗑️", key=f"del_{ticker}"):
+            if st.button("❌", key=f"del_{ticker}"):
                 delete_ticker(ticker)
                 st.rerun()
 
 # ==========================================
 # UI: MAIN CONTENT
 # ==========================================
-st.subheader("🤖 AI Smart Money Analysis")
-
-# Input Section
+# Input Bar
 with st.container():
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
     with c1:
-        # รับค่าจาก session_state ที่ถูก update จาก Sidebar ได้
-        ticker_input = st.text_input("Symbol", value=st.session_state.selected_ticker)
+        ticker_input = st.text_input("ค้นหาหุ้น", value=st.session_state.selected_ticker)
     with c2:
         period = st.selectbox("Period", ["1y", "2y", "5y", "max"], index=1)
     with c3:
@@ -288,21 +256,23 @@ with st.container():
         st.write("") 
         run_btn = st.button("Analyze", type="primary", use_container_width=True)
 
-# Main Logic
-# รันเมื่อกดปุ่ม Analyze หรือเมื่อค่าใน ticker_input เปลี่ยน (จากการกด sidebar)
 if run_btn or ticker_input != st.session_state.get('last_run_ticker', ''):
-    st.session_state.last_run_ticker = ticker_input # กันรันซ้ำซ้อน
-    st.session_state.selected_ticker = ticker_input # Sync กลับไป
+    st.session_state.last_run_ticker = ticker_input
+    st.session_state.selected_ticker = ticker_input
 
     analyzer = SmartMoneyAnalyzer(ticker_input, period, timeframe)
     
-    with st.spinner(f'กำลังวิเคราะห์พฤติกรรมเจ้ามือ {ticker_input}...'):
+    with st.spinner('กำลังโหลดข้อมูลและวิเคราะห์...'):
         if analyzer.fetch_data():
             analyzer.train_hmm()
             df = analyzer.data
             price, phase, sm_vwap = analyzer.get_stats()
 
-            # --- Metrics ---
+            # --- HEADER: แสดงชื่อหุ้น ---
+            st.markdown(f'<p class="stock-title">{analyzer.asset_name}</p>', unsafe_allow_html=True)
+            st.markdown(f'<p class="stock-subtitle">Symbol: {ticker_input.upper()} • Timeframe: {timeframe}</p>', unsafe_allow_html=True)
+
+            # --- METRICS ---
             m1, m2, m3 = st.columns([1, 1.5, 1.5])
             with m1:
                 st.metric("ราคาตลาด", f"${price:,.2f}")
@@ -317,28 +287,25 @@ if run_btn or ticker_input != st.session_state.get('last_run_ticker', ''):
                     'Accumulation (เก็บของ)': '#00C805', 
                     'Markup (ขาขึ้น)': '#0066FF',
                     'Distribution (ระบายของ)': '#FF9900', 
-                    'Markdown (ขาลง)': '#FF3333',
-                    'Uncertain': 'gray'
+                    'Markdown (ขาลง)': '#FF3333'
                 }
                 phase_color = color_map.get(phase, 'black')
                 st.markdown(f"""
-                <div style="font-size: 14px; color: #666;">สถานะ:</div>
+                <div style="font-size: 14px; color: #666;">สถานะตลาด:</div>
                 <div style="font-size: 24px; font-weight: bold; color: {phase_color};">{phase}</div>
                 """, unsafe_allow_html=True)
 
             st.markdown("---")
 
-            # --- Chart ---
+            # --- CHART ---
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                                 vertical_spacing=0.05, row_heights=[0.7, 0.3])
 
-            # Price Line
             fig.add_trace(go.Scatter(
                 x=df.index, y=df['close'], mode='lines',
                 line=dict(color='lightgray', width=1), name='Price'
             ), row=1, col=1)
 
-            # Colored Dots
             phases_order = ['Accumulation (เก็บของ)', 'Markup (ขาขึ้น)', 'Distribution (ระบายของ)', 'Markdown (ขาลง)']
             colors_list = ['#00C805', '#0066FF', '#FF9900', '#FF3333']
             
@@ -351,18 +318,14 @@ if run_btn or ticker_input != st.session_state.get('last_run_ticker', ''):
                         name=p_name
                     ), row=1, col=1)
 
-            # RSI
             fig.add_trace(go.Scatter(x=df.index, y=df['rsi'], line=dict(color='#9370DB', width=1.5), name='RSI'), row=2, col=1)
             fig.add_hline(y=70, line_dash="dot", line_color="gray", row=2, col=1)
             fig.add_hline(y=30, line_dash="dot", line_color="gray", row=2, col=1)
 
-            fig.update_layout(height=600, template='plotly_white', margin=dict(l=20, r=20, t=30, b=20),
-                              hovermode="x unified")
-            fig.update_yaxes(showgrid=True, gridcolor='#f0f0f0')
+            fig.update_layout(height=600, template='plotly_white', margin=dict(l=20, r=20, t=10, b=20),
+                              hovermode="x unified", title_text="")
             
             st.plotly_chart(fig, use_container_width=True)
 
         else:
-            st.error(f"ไม่พบข้อมูลสำหรับ {ticker_input} กรุณาตรวจสอบชื่อหุ้น")
-
-
+            st.error(f"ไม่พบข้อมูลสำหรับ {ticker_input}")
