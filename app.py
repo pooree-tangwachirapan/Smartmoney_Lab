@@ -201,19 +201,24 @@ class SmartMoneyAnalyzer:
 
         self.data['phase'] = self.data['state'].map(labels).fillna('Uncertain')
 
-    def get_stats(self):
+def get_stats(self):
         if self.data is None: return None
         current_price = self.data['close'].iloc[-1]
         current_phase = self.data['phase'].iloc[-1]
         
-        acc_mask = self.data['phase'] == 'Accumulation (เก็บของ)'
-        if acc_mask.any():
-            self.data['group'] = (self.data['phase'] != self.data['phase'].shift()).cumsum()
-            recent_groups = self.data[acc_mask]['group'].unique()
-            last_group = recent_groups[-1]
-            last_acc_data = self.data[self.data['group'] == last_group]
+        # คัดกรองเฉพาะช่วงที่เป็น Accumulation
+        acc_data = self.data[self.data['phase'] == 'Accumulation (เก็บของ)']
+        
+        if not acc_data.empty:
+            # --- แก้ไข Logic: คำนวณ VWAP จาก Accumulation ทั้งหมดในกรอบเวลา ---
+            # สูตร: (Price * Volume) ของทุกวันรวมกัน / Volume รวมทั้งหมด
+            total_vol = acc_data['volume'].sum()
+            total_vol_price = (acc_data['close'] * acc_data['volume']).sum()
             
-            sm_vwap = (last_acc_data['close'] * last_acc_data['volume']).sum() / last_acc_data['volume'].sum()
+            if total_vol > 0:
+                sm_vwap = total_vol_price / total_vol
+            else:
+                sm_vwap = None
         else:
             sm_vwap = None
 
@@ -329,3 +334,4 @@ if run_btn or ticker_input != st.session_state.get('last_run_ticker', ''):
 
         else:
             st.error(f"ไม่พบข้อมูลสำหรับ {ticker_input}")
+
